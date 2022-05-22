@@ -1,70 +1,70 @@
-use std::io::Cursor;
-use apache_avro::{AvroSchema, SpecificSingleObjectWriter, SpecificSingleObjectReader};
 use apache_avro::schema::derive::AvroSchemaComponent;
-use bytes::{BytesMut, Buf};
+use apache_avro::{AvroSchema, SpecificSingleObjectReader, SpecificSingleObjectWriter};
+use bytes::{Buf, BytesMut};
 use serde::de::DeserializeOwned;
-use serde::{Serialize, Deserialize};
-use tokio::io::{BufWriter, AsyncWriteExt, self, AsyncReadExt};
-use tokio::net::TcpStream;
+use serde::{Deserialize, Serialize};
+use std::io::Cursor;
+use tokio::io::{self, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::tcp::{ReadHalf, WriteHalf};
+use tokio::net::TcpStream;
 
-#[derive(Debug, Serialize, Deserialize, AvroSchema)]
-pub struct AppendEntriesRequest<Command> 
+#[derive(Clone, Debug, Serialize, Deserialize, AvroSchema, PartialEq, Eq)]
+pub struct AppendEntriesRequest<C>
 where
-    Command: AvroSchemaComponent + Sync + Send
+    C: AvroSchemaComponent + Sync + Send,
 {
-    term : i64,
+    term: i64,
     leader_id: String,
     prev_log_index: i64,
     prev_log_term: i64,
-    entries: Vec<LogEntry<Command>>,
+    entries: Vec<LogEntry<C>>,
     leader_commit: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize, AvroSchema)]
-pub struct LogEntry<Command>
+#[derive(Clone, Debug, Serialize, Deserialize, AvroSchema, PartialEq, Eq)]
+pub struct LogEntry<C>
 where
-    Command : AvroSchemaComponent + Sync + Send
+    C: AvroSchemaComponent + Sync + Send,
 {
     term: i64,
     log_idex: i64,
-    command: Command
+    command: C,
 }
 
-#[derive(Debug, Serialize, Deserialize, AvroSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, AvroSchema, PartialEq, Eq)]
 pub struct AppendEntriesResult {
-    term : i64,
+    term: i64,
     success: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize, AvroSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, AvroSchema, PartialEq, Eq)]
 pub struct RequestVoteRequest {
     term: i64,
     candidate_id: String,
     last_log_index: i64,
-    last_log_term: i64
+    last_log_term: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize, AvroSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, AvroSchema, PartialEq, Eq)]
 pub struct RequestVoteResult {
     term: i64,
-    vote_granted: bool
+    vote_granted: bool,
 }
 
-pub enum Message<Command> 
+#[derive(Clone, PartialEq, Eq)]
+pub enum Message<C>
 where
-    Command: AvroSchemaComponent + Sync + Send
+    C: AvroSchemaComponent + Sync + Send,
 {
-    AEReq(AppendEntriesRequest<Command>),
+    AEReq(AppendEntriesRequest<C>),
     AERes(AppendEntriesResult),
     RVReq(RequestVoteRequest),
     RVRes(RequestVoteResult),
 }
 
-
-impl <Command> Message<Command> 
-where 
-    Command: AvroSchemaComponent + Sync + Send 
+impl<C> Message<C>
+where
+    C: AvroSchemaComponent + Sync + Send,
 {
     fn get_frame_header(&self) -> u8 {
         match self {
@@ -76,35 +76,46 @@ where
     }
 }
 
-
-pub struct MessageWriter<Command> 
-where 
-    Command: AvroSchemaComponent + Sync + Send
+pub struct MessageWriter<C>
+where
+    C: AvroSchemaComponent + Sync + Send,
 {
-    append_entry_request_writer: SpecificSingleObjectWriter<AppendEntriesRequest<Command>>,
+    append_entry_request_writer: SpecificSingleObjectWriter<AppendEntriesRequest<C>>,
     append_entry_result_writer: SpecificSingleObjectWriter<AppendEntriesResult>,
     request_vote_request_writer: SpecificSingleObjectWriter<RequestVoteRequest>,
-    request_vote_result_writer: SpecificSingleObjectWriter<RequestVoteResult>
+    request_vote_result_writer: SpecificSingleObjectWriter<RequestVoteResult>,
 }
 
-impl <Command> MessageWriter<Command> 
-where 
-    Command: AvroSchemaComponent + Serialize + DeserializeOwned + Sync + Send
+impl<C> MessageWriter<C>
+where
+    C: AvroSchemaComponent + Serialize + DeserializeOwned + Sync + Send,
 {
-    pub fn new() -> MessageWriter<Command> {
-        MessageWriter::<Command> {
-            append_entry_request_writer: SpecificSingleObjectWriter::<AppendEntriesRequest::<Command>>::with_capacity(1024).expect("Unable to resolve Schema"),
-            append_entry_result_writer: SpecificSingleObjectWriter::<AppendEntriesResult>::with_capacity(1024).expect("Unable to resolve Schema"),
-            request_vote_request_writer: SpecificSingleObjectWriter::<RequestVoteRequest>::with_capacity(1024).expect("Unable to resolve Schema"),
-            request_vote_result_writer: SpecificSingleObjectWriter::<RequestVoteResult>::with_capacity(1024).expect("Unable to resolve Schema")
+    pub fn new() -> MessageWriter<C> {
+        MessageWriter::<C> {
+            append_entry_request_writer:
+                SpecificSingleObjectWriter::<AppendEntriesRequest<C>>::with_capacity(1024)
+                    .expect("Unable to resolve Schema"),
+            append_entry_result_writer:
+                SpecificSingleObjectWriter::<AppendEntriesResult>::with_capacity(1024)
+                    .expect("Unable to resolve Schema"),
+            request_vote_request_writer:
+                SpecificSingleObjectWriter::<RequestVoteRequest>::with_capacity(1024)
+                    .expect("Unable to resolve Schema"),
+            request_vote_result_writer:
+                SpecificSingleObjectWriter::<RequestVoteResult>::with_capacity(1024)
+                    .expect("Unable to resolve Schema"),
         }
     }
 
-    pub async fn send(&mut self, m: Message<Command>,  buf: &mut BufWriter<WriteHalf<'_>>) -> Result<usize, ProtocolError> {
+    pub async fn write<W: AsyncWrite + Unpin>(
+        &mut self,
+        m: Message<C>,
+        buf: &mut BufWriter<W>,
+    ) -> Result<usize, ProtocolError> {
         let mut out = Vec::with_capacity(1024);
         out.push(m.get_frame_header());
         out.extend_from_slice(&0u32.to_be_bytes());
-        let len  = match m {
+        let len = match m {
             Message::AEReq(msg) => self.append_entry_request_writer.write(msg, &mut out)?,
             Message::AERes(msg) => self.append_entry_result_writer.write(msg, &mut out)?,
             Message::RVReq(msg) => self.request_vote_request_writer.write(msg, &mut out)?,
@@ -112,38 +123,46 @@ where
         };
         let len: [u8; 4] = (len as u32).to_be_bytes();
         for i in 1usize..5 {
-            out.insert(i, len[i-1])
+            let _ = std::mem::replace(&mut out[i], len[i - 1]);
         }
         buf.write_all(&out[..]).await?;
         Ok(out.len())
     }
 }
 
-pub struct MessageReader<Command> 
-where 
-    Command: AvroSchemaComponent + Sync + Send
+pub struct MessageReader<C>
+where
+    C: AvroSchemaComponent + Sync + Send,
 {
-    append_entry_request_reader: SpecificSingleObjectReader<AppendEntriesRequest<Command>>,
+    append_entry_request_reader: SpecificSingleObjectReader<AppendEntriesRequest<C>>,
     append_entry_result_reader: SpecificSingleObjectReader<AppendEntriesResult>,
     request_vote_request_reader: SpecificSingleObjectReader<RequestVoteRequest>,
-    request_vote_result_reader: SpecificSingleObjectReader<RequestVoteResult>
+    request_vote_result_reader: SpecificSingleObjectReader<RequestVoteResult>,
 }
 
-impl <Command> MessageReader<Command> 
-where 
-    Command: AvroSchemaComponent + Serialize + DeserializeOwned + Sync + Send
+impl<C> MessageReader<C>
+where
+    C: AvroSchemaComponent + Serialize + DeserializeOwned + Sync + Send,
 {
-    pub fn new() -> MessageReader<Command> {
-        MessageReader::<Command> {
-            append_entry_request_reader: SpecificSingleObjectReader::<AppendEntriesRequest::<Command>>::new().expect("Unable to resolve Schema"),
-            append_entry_result_reader: SpecificSingleObjectReader::<AppendEntriesResult>::new().expect("Unable to resolve Schema"),
-            request_vote_request_reader: SpecificSingleObjectReader::<RequestVoteRequest>::new().expect("Unable to resolve Schema"),
-            request_vote_result_reader: SpecificSingleObjectReader::<RequestVoteResult>::new().expect("Unable to resolve Schema")
+    pub fn new() -> MessageReader<C> {
+        MessageReader::<C> {
+            append_entry_request_reader:
+                SpecificSingleObjectReader::<AppendEntriesRequest<C>>::new()
+                    .expect("Unable to resolve Schema"),
+            append_entry_result_reader: SpecificSingleObjectReader::<AppendEntriesResult>::new()
+                .expect("Unable to resolve Schema"),
+            request_vote_request_reader: SpecificSingleObjectReader::<RequestVoteRequest>::new()
+                .expect("Unable to resolve Schema"),
+            request_vote_result_reader: SpecificSingleObjectReader::<RequestVoteResult>::new()
+                .expect("Unable to resolve Schema"),
         }
     }
 
-    pub async fn read(&mut self, buf: &mut Cursor<&[u8]>) -> Result<Message<Command>, ProtocolError> {
-        let frame_id =  buf.read_u8().await?;
+    pub async fn read(&mut self, buf: &mut Cursor<&[u8]>) -> Result<Message<C>, ProtocolError> {
+        if buf.remaining() < 5 {
+            return Err(ProtocolError::IncompleteFrame);
+        }
+        let frame_id = buf.read_u8().await?;
         let len = buf.read_u32().await?;
         if buf.remaining() >= len as usize {
             Ok(match frame_id {
@@ -159,33 +178,77 @@ where
     }
 }
 
-pub struct ReadConnection<'a, Command> 
-where 
-    Command: AvroSchemaComponent + Sync + Send
+pub async fn connection_reader<'a, C>(
+    mut tcp_stream_read: ReadHalf<'a>,
+    message_queue: tokio::sync::mpsc::Sender<Message<C>>,
+) where
+    C: AvroSchemaComponent + Serialize + DeserializeOwned + Sync + Send,
 {
-    stream: ReadHalf<'a>,
-    reader: MessageReader<Command>,
-    buffer: BytesMut,
-}
-
-pub struct WriteConnection<'a, Command> 
-where 
-    Command: AvroSchemaComponent + Sync + Send + Serialize
-{
-    stream: BufWriter<WriteHalf<'a>>,
-    writer: MessageWriter<Command>,
-}
-
-impl <'a, Command> WriteConnection<'a, Command> 
-where 
-    Command: AvroSchemaComponent + Sync + Send + Serialize + DeserializeOwned
-{
-    pub async fn send_message(&mut self, msg: Message<Command>) -> Result<usize, ProtocolError> {
-        self.writer.send(msg, &mut self.stream).await
+    let mut input_buffer = BytesMut::new();
+    let mut message_reader: MessageReader<C> = MessageReader::new();
+    loop {
+        if let Ok(read_amount) = tcp_stream_read.read(&mut input_buffer).await {
+            if read_amount > 0 {
+                let mut messages: Vec<Message<C>> = Vec::with_capacity(5);
+                let mut cursor = Cursor::new(&input_buffer[..]);
+                loop {
+                    match message_reader.read(&mut cursor).await {
+                        Ok(message) => messages.push(message),
+                        Err(ProtocolError::IncompleteFrame) => break,
+                        Err(ProtocolError::FrameDeSynced) => return,
+                        Err(protocol_error) => match protocol_error {
+                            ProtocolError::Serialization(_) => todo!(),
+                            ProtocolError::Io(_) => todo!(),
+                            ProtocolError::IncompleteFrame | ProtocolError::FrameDeSynced => {
+                                unreachable!()
+                            }
+                        },
+                    }
+                }
+                let read_amount = cursor.position();
+                input_buffer.advance(read_amount as usize);
+                for message in messages.into_iter() {
+                    if let Err(e) = message_queue.send(message).await {
+                        // TODO log error, retry?
+                        println!("ERROR PUSHING MESSAGE TO QUEUE")
+                    }
+                }
+            } else {
+                //TODO LOG connection reset, send reconnect request
+                println!("CONNECTION RESET BY PEER");
+                return;
+            }
+        } else {
+            //TODO LOG connection error, send reconnect request
+            println!("IO ERROR WHILE READING");
+            return;
+        }
     }
 }
 
+pub async fn connection_writer<'a, C>(
+    tcp_stream_write: WriteHalf<'a>,
+    mut message_queue: tokio::sync::mpsc::Receiver<Message<C>>,
+) where
+    C: AvroSchemaComponent + Serialize + DeserializeOwned + Sync + Send,
+{
+    let mut tcp_stream_write = BufWriter::new(tcp_stream_write);
+    let mut message_writer = MessageWriter::<C>::new();
+    while let Some(message) = message_queue.recv().await {
+        match message_writer.write(message, &mut tcp_stream_write).await {
+            Ok(_) => (), /*implement messages sent callback*/
+            Err(ProtocolError::IncompleteFrame) => unreachable!(),
+            Err(protocol_error) => match protocol_error {
+                ProtocolError::Serialization(_) => todo!(),
+                ProtocolError::Io(_) => todo!(),
+                ProtocolError::IncompleteFrame => unreachable!(),
+                ProtocolError::FrameDeSynced => todo!(),
+            },
+        }
+    }
+}
 
+#[derive(Debug)]
 pub enum ProtocolError {
     Serialization(apache_avro::Error),
     Io(io::Error),
@@ -206,4 +269,90 @@ impl From<apache_avro::Error> for ProtocolError {
 }
 mod tests {
     use super::*;
+
+    #[derive(Clone, Debug, Serialize, Deserialize, AvroSchema, PartialEq)]
+    struct TestC {
+        key: String,
+        value: Option<String>,
+    }
+
+    #[test]
+    pub fn test_message_protocol() {
+        let m1 = Message::<TestC>::AEReq(AppendEntriesRequest {
+            term: 42,
+            leader_id: "Im the leader".into(),
+            prev_log_index: 3,
+            prev_log_term: 2,
+            entries: vec![LogEntry {
+                term: 3,
+                log_idex: 4,
+                command: TestC {
+                    key: "key".into(),
+                    value: Some("value".into()),
+                },
+            }],
+            leader_commit: 3,
+        });
+        let m2 = Message::<TestC>::AERes(AppendEntriesResult {
+            term: 3i64,
+            success: true,
+        });
+        let m3 = Message::<TestC>::RVReq(RequestVoteRequest {
+            term: 3,
+            candidate_id: "Please make me leader".into(),
+            last_log_index: 4,
+            last_log_term: 3,
+        });
+        let m4 = Message::<TestC>::RVRes(RequestVoteResult {
+            term: 5,
+            vote_granted: false,
+        });
+        let mut bites = BufWriter::new(Vec::<u8>::new());
+        let mut mw = MessageWriter::<TestC>::new();
+        let mut mr = MessageReader::<TestC>::new();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                mw.write(m1.clone(), &mut bites)
+                    .await
+                    .expect("Should write");
+                mw.write(m2.clone(), &mut bites)
+                    .await
+                    .expect("Should write");
+                mw.write(m3.clone(), &mut bites)
+                    .await
+                    .expect("Should write");
+                mw.write(m4.clone(), &mut bites)
+                    .await
+                    .expect("Should write");
+                bites.flush().await.expect("Should flush");
+                let bites = bites.into_inner();
+                let mut inner = Cursor::new(&bites[..]);
+                let read_m1 = mr.read(&mut inner).await.expect("Should read");
+                let read_m2 = mr.read(&mut inner).await.expect("Should read");
+                let read_m3 = mr.read(&mut inner).await.expect("Should read");
+                let read_m4 = mr.read(&mut inner).await.expect("Should read");
+
+                assert_msg_eq(m1, read_m1);
+                assert_msg_eq(m2, read_m2);
+                assert_msg_eq(m3, read_m3);
+                assert_msg_eq(m4, read_m4);
+            });
+    }
+
+    fn assert_msg_eq<T: AvroSchemaComponent + Sync + Send + PartialEq + std::fmt::Debug>(
+        expect: Message<T>,
+        actual: Message<T>,
+    ) {
+        match (expect, actual) {
+            (Message::AEReq(expect), Message::AEReq(actual)) => assert_eq!(expect, actual),
+            (Message::AERes(expect), Message::AERes(actual)) => assert_eq!(expect, actual),
+            (Message::RVReq(expect), Message::RVReq(actual)) => assert_eq!(expect, actual),
+            (Message::RVRes(expect), Message::RVRes(actual)) => assert_eq!(expect, actual),
+            _ => assert!(false, "Non-matching types"),
+        }
+    }
 }
