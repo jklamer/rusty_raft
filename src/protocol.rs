@@ -3,6 +3,7 @@ use apache_avro::{AvroSchema, SpecificSingleObjectReader, SpecificSingleObjectWr
 use bytes::{Buf, BytesMut};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use strum::{EnumDiscriminants, EnumIter};
 use std::io::Cursor;
 use tokio::io::{self, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::tcp::{ReadHalf, WriteHalf};
@@ -51,7 +52,9 @@ pub struct RequestVoteResult {
     vote_granted: bool,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, EnumDiscriminants)]
+#[strum_discriminants(name(MessageKind))]
+#[strum_discriminants(derive(EnumIter))]
 pub enum Message<C>
 where
     C: AvroSchemaComponent + Sync + Send,
@@ -60,6 +63,7 @@ where
     AERes(AppendEntriesResult),
     RVReq(RequestVoteRequest),
     RVRes(RequestVoteResult),
+    ServerId(String)
 }
 
 impl<C> Message<C>
@@ -67,13 +71,31 @@ where
     C: AvroSchemaComponent + Sync + Send,
 {
     fn get_frame_header(&self) -> u8 {
-        match self {
-            Message::AEReq(_) => b'+',
-            Message::AERes(_) => b'-',
-            Message::RVReq(_) => b'=',
-            Message::RVRes(_) => b'/',
-        }
+        message_marker_from_kind(&self.into())
     }
+}
+
+fn message_marker_from_kind(message_kind: &MessageKind) -> u8
+{
+    match message_kind {
+        MessageKind::AEReq => b'+',
+        MessageKind::AERes => b'-',
+        MessageKind::RVReq => b'=',
+        MessageKind::RVRes => b'/',
+        MessageKind::ServerId => b'*'
+    }
+}
+
+fn message_marker_to_kind(marker: u8) -> Result<MessageKind, ProtocolError>
+{
+    Ok(match marker {
+        b'+' => MessageKind::AEReq,
+        b'-' => MessageKind::AERes,
+        b'=' => MessageKind::RVReq,
+        b'/' => MessageKind::RVRes,
+        b'*' => MessageKind::ServerId,
+        _ => return Err(ProtocolError::FrameDeSynced),
+    })
 }
 
 pub struct MessageWriter<C>
@@ -84,6 +106,7 @@ where
     append_entry_result_writer: SpecificSingleObjectWriter<AppendEntriesResult>,
     request_vote_request_writer: SpecificSingleObjectWriter<RequestVoteRequest>,
     request_vote_result_writer: SpecificSingleObjectWriter<RequestVoteResult>,
+    server_id_writer: SpecificSingleObjectWriter<String>
 }
 
 impl<C> MessageWriter<C>
@@ -104,6 +127,9 @@ where
             request_vote_result_writer:
                 SpecificSingleObjectWriter::<RequestVoteResult>::with_capacity(1024)
                     .expect("Unable to resolve Schema"),
+            server_id_writer:
+                SpecificSingleObjectWriter::<String>::with_capacity(64)
+                    .expect("Unable to resolve Schema"),
         }
     }
 
@@ -120,6 +146,7 @@ where
             Message::AERes(msg) => self.append_entry_result_writer.write(msg, &mut out)?,
             Message::RVReq(msg) => self.request_vote_request_writer.write(msg, &mut out)?,
             Message::RVRes(msg) => self.request_vote_result_writer.write(msg, &mut out)?,
+            Message::ServerId(id) => self.server_id_writer.write(id, &mut out)?
         };
         let len: [u8; 4] = (len as u32).to_be_bytes();
         for i in 1usize..5 {
@@ -138,6 +165,7 @@ where
     append_entry_result_reader: SpecificSingleObjectReader<AppendEntriesResult>,
     request_vote_request_reader: SpecificSingleObjectReader<RequestVoteRequest>,
     request_vote_result_reader: SpecificSingleObjectReader<RequestVoteResult>,
+    server_id_reader: SpecificSingleObjectReader<String>
 }
 
 impl<C> MessageReader<C>
@@ -155,6 +183,7 @@ where
                 .expect("Unable to resolve Schema"),
             request_vote_result_reader: SpecificSingleObjectReader::<RequestVoteResult>::new()
                 .expect("Unable to resolve Schema"),
+            server_id_reader: SpecificSingleObjectReader::<String>::new().expect("unable to resolve schema")
         }
     }
 
@@ -162,15 +191,15 @@ where
         if buf.remaining() < 5 {
             return Err(ProtocolError::IncompleteFrame);
         }
-        let frame_id = buf.read_u8().await?;
+        let frame_id = message_marker_to_kind(buf.read_u8().await?)?;
         let len = buf.read_u32().await?;
         if buf.remaining() >= len as usize {
             Ok(match frame_id {
-                b'+' => Message::AEReq(self.append_entry_request_reader.read(buf)?),
-                b'-' => Message::AERes(self.append_entry_result_reader.read(buf)?),
-                b'=' => Message::RVReq(self.request_vote_request_reader.read(buf)?),
-                b'/' => Message::RVRes(self.request_vote_result_reader.read(buf)?),
-                _ => return Err(ProtocolError::FrameDeSynced),
+                MessageKind::AEReq => Message::AEReq(self.append_entry_request_reader.read(buf)?),
+                MessageKind::AERes => Message::AERes(self.append_entry_result_reader.read(buf)?),
+                MessageKind::RVReq => Message::RVReq(self.request_vote_request_reader.read(buf)?),
+                MessageKind::RVRes => Message::RVRes(self.request_vote_result_reader.read(buf)?),
+                MessageKind::ServerId => Message::ServerId(self.server_id_reader.read(buf)?)
             })
         } else {
             Err(ProtocolError::IncompleteFrame)
@@ -195,7 +224,10 @@ pub async fn connection_reader<'a, C>(
                     match message_reader.read(&mut cursor).await {
                         Ok(message) => messages.push(message),
                         Err(ProtocolError::IncompleteFrame) => break,
-                        Err(ProtocolError::FrameDeSynced) => return,
+                        Err(ProtocolError::FrameDeSynced) => {
+                            println!("FRAME DESYNCED");
+                            return;
+                        },
                         Err(protocol_error) => match protocol_error {
                             ProtocolError::Serialization(_) => todo!(),
                             ProtocolError::Io(_) => todo!(),
@@ -237,12 +269,11 @@ pub async fn connection_writer<'a, C>(
     while let Some(message) = message_queue.recv().await {
         match message_writer.write(message, &mut tcp_stream_write).await {
             Ok(_) => (), /*implement messages sent callback*/
-            Err(ProtocolError::IncompleteFrame) => unreachable!(),
             Err(protocol_error) => match protocol_error {
                 ProtocolError::Serialization(_) => todo!(),
                 ProtocolError::Io(_) => todo!(),
                 ProtocolError::IncompleteFrame => unreachable!(),
-                ProtocolError::FrameDeSynced => todo!(),
+                ProtocolError::FrameDeSynced => unreachable!(),
             },
         }
     }
@@ -268,6 +299,8 @@ impl From<apache_avro::Error> for ProtocolError {
     }
 }
 mod tests {
+    use strum::IntoEnumIterator;
+
     use super::*;
 
     #[derive(Clone, Debug, Serialize, Deserialize, AvroSchema, PartialEq)]
@@ -307,6 +340,7 @@ mod tests {
             term: 5,
             vote_granted: false,
         });
+        let m5 = Message::<TestC>::ServerId("id".into());
         let mut bites = BufWriter::new(Vec::<u8>::new());
         let mut mw = MessageWriter::<TestC>::new();
         let mut mr = MessageReader::<TestC>::new();
@@ -328,6 +362,9 @@ mod tests {
                 mw.write(m4.clone(), &mut bites)
                     .await
                     .expect("Should write");
+                mw.write(m5.clone(), &mut bites)
+                    .await
+                    .expect("Should write");
                 bites.flush().await.expect("Should flush");
                 let bites = bites.into_inner();
                 let mut inner = Cursor::new(&bites[..]);
@@ -335,11 +372,13 @@ mod tests {
                 let read_m2 = mr.read(&mut inner).await.expect("Should read");
                 let read_m3 = mr.read(&mut inner).await.expect("Should read");
                 let read_m4 = mr.read(&mut inner).await.expect("Should read");
+                let read_m5 = mr.read(&mut inner).await.expect("Should read");
 
                 assert_msg_eq(m1, read_m1);
                 assert_msg_eq(m2, read_m2);
                 assert_msg_eq(m3, read_m3);
                 assert_msg_eq(m4, read_m4);
+                assert_msg_eq(m5, read_m5);
             });
     }
 
@@ -352,7 +391,15 @@ mod tests {
             (Message::AERes(expect), Message::AERes(actual)) => assert_eq!(expect, actual),
             (Message::RVReq(expect), Message::RVReq(actual)) => assert_eq!(expect, actual),
             (Message::RVRes(expect), Message::RVRes(actual)) => assert_eq!(expect, actual),
+            (Message::ServerId(expect), Message::ServerId(actual)) => assert_eq!(expect, actual),
             _ => assert!(false, "Non-matching types"),
+        }
+    }
+
+    #[test]
+    fn test_marker_serde() {
+        for kind in MessageKind::iter() {
+            assert_eq!(kind, message_marker_to_kind(message_marker_from_kind(&kind)).expect("match input bytes to outputs"), "match input bytes to outputs")
         }
     }
 }
