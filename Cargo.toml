@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
-apache-avro = {path = "../avro/lang/rust/avro", features= ["derive"]}
+apache-avro = {version = "0.14", features= ["derive"]}
 serde = "1"
 strum = { version = "0.24", features = ["derive"] }
 
